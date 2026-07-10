@@ -25,41 +25,56 @@
 //!
 //! ## Quickstart
 //!
+//! The raw ping is a single HTTP GET — this is the exact `curl` equivalent:
+//!
+//! ```sh
+//! curl -m 10 --retry 2 https://signal.ionhour.com/api/signals/ping/your-job-token
+//! ```
+//!
+//! The SDK is that same ping with retries, timeouts, and failure signaling
+//! handled for you. The shortest path — no config, no options — is two lines:
+//!
 //! ```no_run
-//! use ionhour::{Client, PingOptions};
-//!
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! // Reads IONHOUR_API_KEY / IONHOUR_BASE_URL from the environment if set.
-//! let client = Client::new();
+//! let job = ionhour::Client::new().register_job("your-job-token")?;
+//! job.success().await?;
+//! # Ok(())
+//! # }
+//! ```
 //!
-//! // A protected job takes a per-job API key that overrides the client key.
-//! let job = client.register_job_with_key("job-token-abc", "ionh_live_xxx")?;
+//! Wrap a fallible task with [`Job::run`] to send a start ping, then ping
+//! success on `Ok` (with the measured duration) or fail on `Err`, re-returning
+//! your own error. The start and terminal pings share an auto-generated `rid`
+//! so they correlate:
 //!
-//! // Wrap the work: on Ok pings success with the measured duration; on Err
-//! // pings fail with the error message and re-returns your error.
-//! let count: u64 = job
-//!     .run(|| async { run_backup().await }, PingOptions::new())
-//!     .await?;
+//! ```no_run
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! let job = ionhour::Client::new().register_job("your-job-token")?;
+//! let count: u64 = job.run(|| async { run_backup().await }).await?;
 //! # let _ = count;
 //! # Ok(())
 //! # }
 //! # async fn run_backup() -> Result<u64, std::io::Error> { Ok(42) }
 //! ```
 //!
-//! Manual pings when you don't want the wrapper:
+//! Configure explicitly with [`Client::builder`] (a protected job takes a
+//! per-job key that overrides the client key), and attach telemetry with the
+//! `_with` variants — [`Job::success_with`], [`Job::fail_with`],
+//! [`Job::run_with`]:
 //!
 //! ```no_run
 //! use ionhour::{Client, PingOptions};
 //! use serde_json::json;
 //!
 //! # async fn demo() -> Result<(), ionhour::Error> {
-//! let client = Client::new();
-//! let job = client.register_job("job-token-abc")?;
+//! // Reads IONHOUR_API_KEY / IONHOUR_BASE_URL from the environment if set.
+//! let client = Client::builder().timeout(std::time::Duration::from_secs(5)).build()?;
+//! let job = client.register_job_with_key("your-job-token", "ionh_live_xxx")?;
 //!
 //! // `?` propagates only usage errors (e.g. an oversized payload); a transport
 //! // failure comes back as Ok(result) with result.ok == false.
 //! let result = job
-//!     .success(
+//!     .success_with(
 //!         PingOptions::new()
 //!             .rid("run-42")
 //!             .duration_ms(1200)
@@ -72,10 +87,15 @@
 //! }
 //!
 //! // Report an explicit failure so the monitor goes down immediately.
-//! job.fail(PingOptions::new()).await?;
+//! job.fail().await?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`PingOptions`] also carries telemetry — `host`, `env`, and `exit_code`
+//! (plus `rid`/`duration`) — mapped to query parameters the server records.
+//! [`Job::start`] sends a standalone start ping (persist-only run telemetry
+//! that never changes monitor status); [`Job::run`] emits one automatically.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -91,4 +111,4 @@ pub use client::{
 };
 pub use error::Error;
 pub use job::Job;
-pub use options::{PingOptions, PingResult};
+pub use options::{PingContext, PingOptions, PingResult};

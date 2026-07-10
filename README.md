@@ -14,55 +14,69 @@ cargo add ionhour
 
 ## Quickstart
 
-A job is registered with **two parameters**: the required `job_token` (the
-job's ping token) and an optional `api_key`. The API key is only needed for a
-**protected** job; when present it is sent as `Authorization: Bearer <key>` on
-every ping. Sending it for an unprotected job is harmless, so it is always safe
-to pass one.
+A ping is a single HTTP GET. This is the raw request — no SDK required:
+
+```sh
+curl -m 10 --retry 2 https://signal.ionhour.com/api/signals/ping/your-job-token
+```
+
+The SDK is the **same ping with retries, timeouts, and failure signaling
+handled for you**. The shortest path is two lines — credentials and base URL
+come from `IONHOUR_API_KEY` / `IONHOUR_BASE_URL` when not passed explicitly:
 
 ```rust
-use ionhour::{Client, PingOptions};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Reads IONHOUR_API_KEY / IONHOUR_BASE_URL from the environment if set.
-    let client = Client::new();
-
-    // Protected job: the per-job key overrides any client-wide key.
-    let job = client.register_job_with_key("job-token-abc", "ionh_live_xxx")?;
-
-    // For an unprotected job, omit the key:
-    // let job = client.register_job("job-token-abc")?;
-
-    // Wrap the work: pings success with the measured duration on Ok, or fail
-    // (with the error message) on Err — and re-returns your original error.
-    let rows: u64 = job
-        .run(|| async { run_backup().await }, PingOptions::new())
-        .await?;
-
-    println!("backed up {rows} rows");
-    Ok(())
-}
-
-async fn run_backup() -> Result<u64, std::io::Error> {
-    Ok(42)
-}
+# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+let job = ionhour::Client::new().register_job("your-job-token")?;
+job.success().await?;
+# Ok(())
+# }
 ```
 
 ## The `run` wrapper
 
-`run` times the closure with a monotonic clock and reports the outcome for you:
+`run` wraps a fallible task — it times the closure with a monotonic clock and
+reports the outcome for you, re-returning your own error untouched:
 
+```rust
+# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+let job = ionhour::Client::new().register_job("your-job-token")?;
+
+let rows: u64 = job.run(|| async { run_backup().await }).await?;
+# let _ = rows;
+# Ok(())
+# }
+# async fn run_backup() -> Result<u64, std::io::Error> { Ok(42) }
+```
+
+- Before the closure runs, it sends a best-effort **start** ping so you can see
+  the run in flight. Unless you supplied a `rid`, one is generated and shared by
+  the start and terminal pings so they correlate.
 - On `Ok`, it sends a **success** ping with the measured `duration`.
 - On `Err`, it sends a **failure** ping with `{"error": "<message>"}` merged
   into your payload, then returns the original error unchanged.
 - Ping transport failures never mask your result — they only reach the
-  `on_error` hook.
+  `on_error` hook. The start ping can be disabled with
+  `PingOptions::new().start_ping(false)`.
 
-## Manual pings
+## Protected jobs, telemetry, and the `_with` variants
 
-`PingOptions` is `#[non_exhaustive]`; build it with `PingOptions::new()` and the
-chainable setters.
+A job is registered with **two parameters**: the required `job_token` and an
+optional `api_key`. The API key is only needed for a **protected** job; when
+present it is sent as `Authorization: Bearer <key>` on every ping. Sending it
+for an unprotected job is harmless, so it is always safe to pass one.
+
+The bare `success()` / `ping()` / `fail()` / `start()` / `run(fn)` calls take no
+arguments. When you need a run id, duration, telemetry, or a payload, use the
+`_with` variants — `success_with` / `ping_with` / `fail_with` / `start_with` /
+`run_with`. `PingOptions` is `#[non_exhaustive]`; build it with
+`PingOptions::new()` and the chainable setters: `rid`, `duration_ms`, `host`
+(truncated to 253 chars), `env` (truncated to 32 chars), `exit_code` (a `u8`, so
+0–255 is a compile-time guarantee), and `payload`.
+
+`start()` / `start_with()` send a **start** ping to `/signals/ping/{token}/start`
+— persist-only run telemetry that records a run beginning but never changes
+monitor status, opens/resolves incidents, or resets the schedule. Pair it with a
+terminal ping via a shared `rid` (which `run` does for you).
 
 ```rust
 use ionhour::{Client, PingOptions};
@@ -70,15 +84,21 @@ use serde_json::json;
 
 # async fn demo() -> Result<(), ionhour::Error> {
 let client = Client::new();
-let job = client.register_job("job-token-abc")?;
+
+// Protected job: the per-job key overrides any client-wide key.
+let job = client.register_job_with_key("your-job-token", "ionh_live_xxx")?;
+// For an unprotected job, omit the key:
+// let job = client.register_job("your-job-token")?;
 
 // Success with metadata. `?` propagates only usage errors (e.g. an oversized
 // payload); a transport failure comes back as Ok(result) with result.ok == false.
 let result = job
-    .success(
+    .success_with(
         PingOptions::new()
             .rid("run-42")
             .duration_ms(1200)
+            .host("db-1.internal")
+            .env("production")
             .payload(json!({ "records": 10 })),
     )
     .await?;
@@ -90,7 +110,7 @@ if !result.ok {
 }
 
 // Explicit failure ping: marks the monitor down immediately.
-job.fail(PingOptions::new()).await?;
+job.fail().await?;
 # Ok(())
 # }
 ```
@@ -123,7 +143,7 @@ variable → default**.
 | Base URL     | `base_url`     | `IONHOUR_BASE_URL`  | `https://signal.ionhour.com/api`   |
 | API key      | `api_key`      | `IONHOUR_API_KEY`   | none (only needed for protected jobs) |
 | Timeout      | `timeout`      | —                   | 10s per attempt                    |
-| Retries      | `retries`      | —                   | 3 attempts (backoff 1s, 2s)        |
+| Retries      | `retries`      | —                   | 3 attempts (backoff 1s, then 2s clamped) |
 | User-Agent   | `user_agent`   | —                   | `ionhour-rust/<version>`           |
 | Error hook   | `on_error`     | —                   | none                               |
 
@@ -136,7 +156,13 @@ let client = Client::builder()
     .api_key("ionh_live_xxx")
     .timeout(Duration::from_secs(5))
     .retries(4)
-    .on_error(|err| eprintln!("ionhour ping failed: {err}"))
+    .on_error(|err, ctx| {
+        eprintln!(
+            "ionhour ping failed for {} (fail_ping={}): {err}",
+            ctx.token(),
+            ctx.is_fail(),
+        )
+    })
     .build()?;
 # let _ = client;
 # Ok(())
@@ -144,7 +170,10 @@ let client = Client::builder()
 ```
 
 The `on_error` hook fires only for silent (transport / HTTP) failures; usage
-errors are returned to you directly and do not reach it.
+errors are returned to you directly and do not reach it. It receives a
+`PingContext` alongside the error — the job token and whether the failing ping
+was a `fail` ping — so a single hook shared across many jobs can attribute each
+failure.
 
 Retries apply only to network errors, HTTP 429, and 5xx responses; other 4xx
 responses are never retried. `Client` is cheaply cloneable (`Arc` inside) —

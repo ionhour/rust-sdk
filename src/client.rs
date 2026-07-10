@@ -8,7 +8,7 @@ use reqwest::Url;
 
 use crate::error::Error;
 use crate::job::Job;
-use crate::options::{PingOptions, PingResult};
+use crate::options::{PingContext, PingOptions, PingResult};
 
 /// Default API base URL. Override with `IONHOUR_BASE_URL` or the builder.
 pub const DEFAULT_BASE_URL: &str = "https://signal.ionhour.com/api";
@@ -31,9 +31,35 @@ const ENV_BASE_URL: &str = "IONHOUR_BASE_URL";
 /// Default `User-Agent`, e.g. `ionhour-rust/0.1.0`.
 const DEFAULT_USER_AGENT: &str = concat!("ionhour-rust/", env!("CARGO_PKG_VERSION"));
 
-/// A callback invoked whenever a ping fails. See
-/// [`ClientBuilder::on_error`].
-type OnError = Arc<dyn Fn(&Error) + Send + Sync>;
+/// A callback invoked whenever a ping fails, receiving the [`Error`] plus a
+/// [`PingContext`] identifying the ping. See [`ClientBuilder::on_error`].
+type OnError = Arc<dyn Fn(&Error, &PingContext) + Send + Sync>;
+
+/// Which ping endpoint a request targets. Internal; the public surface exposes
+/// these as the `success`/`fail`/`start` method families on [`Job`].
+#[derive(Clone, Copy)]
+pub(crate) enum PingKind {
+    Success,
+    Fail,
+    Start,
+}
+
+impl PingKind {
+    /// The path segment appended after the token, if any (`success` has none).
+    fn path_suffix(self) -> Option<&'static str> {
+        match self {
+            PingKind::Success => None,
+            PingKind::Fail => Some("fail"),
+            PingKind::Start => Some("start"),
+        }
+    }
+
+    /// Whether this is a `fail` ping — carried in the `on_error` [`PingContext`].
+    /// A `start` ping is telemetry, not a failure, so it reports `false`.
+    fn is_fail(self) -> bool {
+        matches!(self, PingKind::Fail)
+    }
+}
 
 /// A cheaply-cloneable Ionhour client.
 ///
@@ -45,8 +71,8 @@ type OnError = Arc<dyn Fn(&Error) + Send + Sync>;
 ///
 /// # async fn demo() -> Result<(), ionhour::Error> {
 /// let client = Client::new();
-/// let job = client.register_job("job-token-abc")?;
-/// job.success(Default::default()).await;
+/// let job = client.register_job("your-job-token")?;
+/// job.success().await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -165,8 +191,8 @@ impl ClientInner {
     /// `Ok(PingResult { ok: false, .. })` and to the `on_error` hook.
     pub(crate) async fn send_ping(
         &self,
-        token: &str,
-        fail: bool,
+        token: &Arc<str>,
+        kind: PingKind,
         api_key: Option<&str>,
         opts: &PingOptions,
     ) -> Result<PingResult, Error> {
@@ -187,7 +213,7 @@ impl ClientInner {
             None => None,
         };
 
-        let url = self.build_url(token, fail, opts)?;
+        let url = self.build_url(token, kind, opts)?;
 
         let mut attempt: u32 = 0;
         loop {
@@ -205,7 +231,12 @@ impl ClientInner {
                         self.sleep_backoff(attempt).await;
                         continue;
                     }
-                    return Ok(self.fail_result(Some(status), Error::Http { status }));
+                    return Ok(self.fail_result(
+                        token,
+                        kind.is_fail(),
+                        Some(status),
+                        Error::Http { status },
+                    ));
                 }
                 Err(e) => {
                     let retryable = e.is_timeout() || e.is_connect();
@@ -213,7 +244,18 @@ impl ClientInner {
                         self.sleep_backoff(attempt).await;
                         continue;
                     }
-                    return Ok(self.fail_result(None, Error::Transport(e)));
+                    // Scrub the request URL before wrapping: reqwest's Display
+                    // embeds the full URL, whose path carries the job token, so
+                    // an un-scrubbed transport error would leak the credential
+                    // through PingResult.error, the on_error hook text, and any
+                    // caller log. The hook still receives the token via
+                    // PingContext, so nothing is lost.
+                    return Ok(self.fail_result(
+                        token,
+                        kind.is_fail(),
+                        None,
+                        Error::Transport(e.without_url()),
+                    ));
                 }
             }
         }
@@ -246,9 +288,10 @@ impl ClientInner {
         Ok(response.status().as_u16())
     }
 
-    /// Build the request URL: `{base}/signals/ping/{token}[/fail]` plus the
-    /// optional `rid` and `duration` query parameters.
-    fn build_url(&self, token: &str, fail: bool, opts: &PingOptions) -> Result<Url, Error> {
+    /// Build the request URL: `{base}/signals/ping/{token}[/fail|/start]` plus
+    /// the optional `rid`, `duration`, `host`, `env`, and `exit_code` query
+    /// parameters.
+    fn build_url(&self, token: &str, kind: PingKind, opts: &PingOptions) -> Result<Url, Error> {
         let mut url = self.base.clone();
         {
             let mut segments = url
@@ -258,18 +301,32 @@ impl ClientInner {
             // an empty segment / double slash).
             segments.pop_if_empty();
             segments.push("signals").push("ping").push(token);
-            if fail {
-                segments.push("fail");
+            if let Some(suffix) = kind.path_suffix() {
+                segments.push(suffix);
             }
         }
 
-        if opts.rid.is_some() || opts.duration_ms.is_some() {
+        if opts.rid.is_some()
+            || opts.duration_ms.is_some()
+            || opts.host.is_some()
+            || opts.env.is_some()
+            || opts.exit_code.is_some()
+        {
             let mut query = url.query_pairs_mut();
             if let Some(rid) = &opts.rid {
                 query.append_pair("rid", rid);
             }
             if let Some(duration) = opts.duration_ms {
                 query.append_pair("duration", &duration.to_string());
+            }
+            if let Some(host) = &opts.host {
+                query.append_pair("host", host);
+            }
+            if let Some(env) = &opts.env {
+                query.append_pair("env", env);
+            }
+            if let Some(exit_code) = opts.exit_code {
+                query.append_pair("exit_code", &exit_code.to_string());
             }
         }
 
@@ -289,8 +346,14 @@ impl ClientInner {
 
     /// Build a failed [`PingResult`] for a silent (transport / HTTP) failure and
     /// notify the `on_error` hook.
-    fn fail_result(&self, status: Option<u16>, error: Error) -> PingResult {
-        self.report(&error);
+    fn fail_result(
+        &self,
+        token: &Arc<str>,
+        fail: bool,
+        status: Option<u16>,
+        error: Error,
+    ) -> PingResult {
+        self.report(token, fail, &error);
         PingResult {
             ok: false,
             status,
@@ -298,10 +361,12 @@ impl ClientInner {
         }
     }
 
-    /// Invoke the `on_error` hook if one is configured.
-    fn report(&self, error: &Error) {
+    /// Invoke the `on_error` hook if one is configured, passing the failing
+    /// ping's context. The [`PingContext`] is built here (a cheap `Arc` bump)
+    /// only when there is a hook to receive it, so the success path pays nothing.
+    fn report(&self, token: &Arc<str>, fail: bool, error: &Error) {
         if let Some(hook) = &self.on_error {
-            hook(error);
+            hook(error, &PingContext::new(token.clone(), fail));
         }
     }
 }
@@ -377,6 +442,10 @@ impl ClientBuilder {
     /// Register a callback invoked for each *silent* ping failure — a transport
     /// error or a non-2xx HTTP status carried inside a returned [`PingResult`].
     ///
+    /// The callback receives the [`Error`] plus a [`PingContext`] identifying
+    /// the ping — the job token and whether it was a `fail` ping — so a single
+    /// hook shared across many jobs can attribute and route each failure.
+    ///
     /// Usage errors (oversized payload, invalid config) are returned as `Err`
     /// from the ping methods instead and do **not** reach this hook. Use it to
     /// log or count delivery failures. The callback must be cheap and must not
@@ -385,12 +454,21 @@ impl ClientBuilder {
     /// ```
     /// use ionhour::Client;
     /// let client = Client::builder()
-    ///     .on_error(|err| eprintln!("ionhour ping failed: {err}"))
+    ///     .on_error(|err, ctx| {
+    ///         eprintln!(
+    ///             "ionhour ping failed for {} (fail_ping={}): {err}",
+    ///             ctx.token(),
+    ///             ctx.is_fail(),
+    ///         )
+    ///     })
     ///     .build()
     ///     .unwrap();
     /// # let _ = client;
     /// ```
-    pub fn on_error(mut self, on_error: impl Fn(&Error) + Send + Sync + 'static) -> Self {
+    pub fn on_error(
+        mut self,
+        on_error: impl Fn(&Error, &PingContext) + Send + Sync + 'static,
+    ) -> Self {
         self.on_error = Some(Arc::new(on_error));
         self
     }
@@ -400,8 +478,8 @@ impl ClientBuilder {
     ///
     /// Available only with the `test-util` crate feature; it exists so tests can
     /// zero out delays for fast retry assertions. Production code should use
-    /// [`ClientBuilder::retries`], which derives an exponential 1s, 2s, 4s…
-    /// schedule.
+    /// [`ClientBuilder::retries`], which derives the clamped 1s-then-2s
+    /// schedule (see [`default_backoff`]).
     #[cfg(feature = "test-util")]
     pub fn backoff(mut self, backoff: Vec<Duration>) -> Self {
         self.backoff = Some(backoff);
@@ -464,11 +542,20 @@ impl fmt::Debug for ClientBuilder {
     }
 }
 
-/// Derive the default exponential backoff schedule (1s, 2s, 4s, …) covering the
-/// waits between `retries` attempts.
+/// Derive the default backoff schedule covering the waits between `retries`
+/// attempts: 1s for the first wait, then **2s clamped** for every subsequent
+/// wait (1s, 2s, 2s, 2s, …). The clamp keeps a burst of retries from stretching
+/// into minute-long tail waits — a heartbeat that cannot reach the server should
+/// keep trying at a steady cadence, not back off unboundedly.
 fn default_backoff(retries: u32) -> Vec<Duration> {
     (0..retries.saturating_sub(1))
-        .map(|i| Duration::from_secs(1u64 << i.min(16)))
+        .map(|i| {
+            if i == 0 {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(2)
+            }
+        })
         .collect()
 }
 
@@ -508,11 +595,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_backoff_is_exponential() {
+    fn default_backoff_clamps_at_two_seconds() {
+        // The classic 3-attempt schedule: one 1s wait, then a 2s wait.
         assert_eq!(
             default_backoff(3),
             vec![Duration::from_secs(1), Duration::from_secs(2)]
         );
+
+        // With more retries the schedule is 1s, then 2s for EVERY subsequent
+        // wait — never exponential (which would give 4s, 8s, …).
+        let schedule = default_backoff(6);
+        assert_eq!(
+            schedule,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ]
+        );
+        assert_eq!(
+            schedule[3],
+            Duration::from_secs(2),
+            "the 4th wait must be clamped to 2s, not grown exponentially"
+        );
+
         assert_eq!(default_backoff(1), Vec::<Duration>::new());
         assert_eq!(default_backoff(0), Vec::<Duration>::new());
     }

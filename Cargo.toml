@@ -1,0 +1,38 @@
+[package]
+name = "ionhour"
+version = "0.1.0"
+edition = "2021"
+# MSRV for consumers. Floor is imposed by the runtime dependency tree
+# (reqwest 0.12 -> url -> idna_adapter / icu 2.2.0, which require rustc 1.86).
+# Note: running THIS crate's own test suite needs rustc 1.88, because the
+# `wiremock` dev-dependency uses let-chains — that is a dev/test requirement, not
+# a consumer requirement, so it does not raise rust-version.
+rust-version = "1.86"
+license = "MIT"
+description = "Ionhour SDK: register heartbeat jobs and send success/fail pings for uptime and cron monitoring."
+repository = "https://github.com/ionhour/ionhour-rs"
+homepage = "https://ionhour.com"
+documentation = "https://docs.rs/ionhour"
+readme = "README.md"
+keywords = ["ionhour", "monitoring", "uptime", "heartbeat", "cron"]
+categories = ["web-programming", "development-tools"]
+
+[features]
+# Exposes test-only builder hooks (e.g. `ClientBuilder::backoff`). Not part of
+# the stable public API; enabled automatically for this crate's own test suite
+# via the self-referential dev-dependency below.
+test-util = []
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+thiserror = "2"
+
+[dev-dependencies]
+# Self-referential dev-dependency so integration tests (a separate crate) see
+# the `test-util` feature without a command-line flag.
+ionhour = { path = ".", features = ["test-util"] }
+wiremock = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

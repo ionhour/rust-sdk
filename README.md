@@ -184,8 +184,18 @@ build one and share it across your application.
 
 ## Docs
 
+## Base URL
+
+The default `base_url` is `https://signal.ionhour.com/api`, the dedicated
+heartbeat-ingest host. Set `IONHOUR_BASE_URL=https://api.ionhour.com/api` (or
+`ClientBuilder::base_url`) to send pings through the main API host instead; it
+serves every ping route (`/ping/{token}`, `/fail`, `/start`) and is the right
+choice when you also use failure or start pings and your deployment has not yet
+enabled them on the signal host.
+
 Full documentation: <https://docs.ionhour.com> · API reference on
-[docs.rs](https://docs.rs/ionhour).
+[docs.rs](https://docs.rs/ionhour) · machine-readable index for AI agents:
+<https://ionhour.com/llms.txt>.
 
 ## License
 

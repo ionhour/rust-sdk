@@ -65,4 +65,4 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `test-util` crate feature gating test-only builder hooks
   (`ClientBuilder::backoff`).
 
-[0.1.0]: https://github.com/ionhour/ionhour-rs/releases/tag/v0.1.0
+[0.1.0]: https://github.com/ionhour/rust-sdk/releases/tag/v0.1.0

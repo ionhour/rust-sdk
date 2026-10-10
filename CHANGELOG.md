@@ -9,15 +9,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Initial release of the `ionhour` crate.
-- `Client` with `Client::new()` (defaults + `IONHOUR_API_KEY` /
-  `IONHOUR_BASE_URL` env fallbacks) and `Client::builder()` for explicit
-  configuration (`api_key`, `base_url`, `timeout`, `retries`, `user_agent`,
-  `on_error`). `Client` is cheaply cloneable.
-- `Client::register_job(token)` and
-  `Client::register_job_with_key(token, api_key)` — local, non-network job
-  registration with token validation (`Error::InvalidToken`). API keys are
-  trimmed before use so whitespace from a `.env` never leaks into the Bearer
-  header.
+- `Client` with `Client::new()` (defaults + `IONHOUR_BASE_URL` env fallback)
+  and `Client::builder()` for explicit configuration (`base_url`, `timeout`,
+  `retries`, `user_agent`, `on_error`). `Client` is cheaply cloneable.
+- `Client::register_job(token)` — local, non-network job registration with
+  token validation (`Error::InvalidToken`).
+- Pings authenticate by job token alone and never send an `Authorization`
+  header (`IONHOUR_API_KEY` is not read). Protected jobs, which require an API
+  key on pings, will ship with their own option.
 - Zero-ceremony pings: `Job::success` / `Job::ping` / `Job::fail` and
   `Job::run(fn)` take **no arguments**; the telemetry-carrying forms are
   `Job::success_with` / `Job::ping_with` / `Job::fail_with` / `Job::run_with`,
@@ -51,8 +50,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`Fn(&Error, &PingContext)`), exposing the job token (`PingContext::token`)
   and whether the failing ping was a fail ping (`PingContext::is_fail`) so a
   shared hook can attribute failures. Its `Debug` redacts the token.
-- Credential-safe `Debug` for `Client`, `Job`, and `PingContext` (token and API
-  key redacted).
+- Credential-safe `Debug` for `Job` and `PingContext` (token redacted).
 - Transport errors are scrubbed of the request URL (`reqwest::Error::without_url`)
   before being wrapped in `Error::Transport`, so the job token embedded in the
   ping URL never leaks through `PingResult.error`, the `on_error` hook text, or

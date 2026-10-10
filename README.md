@@ -21,8 +21,8 @@ curl -m 10 --retry 2 https://signal.ionhour.com/api/signals/ping/your-job-token
 ```
 
 The SDK is the **same ping with retries, timeouts, and failure signaling
-handled for you**. The shortest path is two lines — credentials and base URL
-come from `IONHOUR_API_KEY` / `IONHOUR_BASE_URL` when not passed explicitly:
+handled for you**. The shortest path is two lines — the base URL comes from
+`IONHOUR_BASE_URL` when not passed explicitly:
 
 ```rust
 # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,12 +58,10 @@ let rows: u64 = job.run(|| async { run_backup().await }).await?;
   `on_error` hook. The start ping can be disabled with
   `PingOptions::new().start_ping(false)`.
 
-## Protected jobs, telemetry, and the `_with` variants
+## Telemetry and the `_with` variants
 
-A job is registered with **two parameters**: the required `job_token` and an
-optional `api_key`. The API key is only needed for a **protected** job; when
-present it is sent as `Authorization: Bearer <key>` on every ping. Sending it
-for an unprotected job is harmless, so it is always safe to pass one.
+A job is registered by its `job_token`, which is the job's credential. Pings send
+no `Authorization` header.
 
 The bare `success()` / `ping()` / `fail()` / `start()` / `run(fn)` calls take no
 arguments. When you need a run id, duration, telemetry, or a payload, use the
@@ -85,10 +83,7 @@ use serde_json::json;
 # async fn demo() -> Result<(), ionhour::Error> {
 let client = Client::new();
 
-// Protected job: the per-job key overrides any client-wide key.
-let job = client.register_job_with_key("your-job-token", "ionh_live_xxx")?;
-// For an unprotected job, omit the key:
-// let job = client.register_job("your-job-token")?;
+let job = client.register_job("your-job-token")?;
 
 // Success with metadata. `?` propagates only usage errors (e.g. an oversized
 // payload); a transport failure comes back as Ok(result) with result.ok == false.
@@ -141,7 +136,6 @@ variable → default**.
 | Option       | Builder method | Env override        | Default                            |
 |--------------|----------------|---------------------|------------------------------------|
 | Base URL     | `base_url`     | `IONHOUR_BASE_URL`  | `https://signal.ionhour.com/api`   |
-| API key      | `api_key`      | `IONHOUR_API_KEY`   | none (only needed for protected jobs) |
 | Timeout      | `timeout`      | —                   | 10s per attempt                    |
 | Retries      | `retries`      | —                   | 3 attempts (backoff 1s, then 2s clamped) |
 | User-Agent   | `user_agent`   | —                   | `ionhour-rust/<version>`           |
@@ -153,7 +147,6 @@ use ionhour::Client;
 
 # fn demo() -> Result<(), ionhour::Error> {
 let client = Client::builder()
-    .api_key("ionh_live_xxx")
     .timeout(Duration::from_secs(5))
     .retries(4)
     .on_error(|err, ctx| {
@@ -179,8 +172,8 @@ Retries apply only to network errors, HTTP 429, and 5xx responses; other 4xx
 responses are never retried. `Client` is cheaply cloneable (`Arc` inside) —
 build one and share it across your application.
 
-> **Note:** the API key is only required for **protected** jobs. Unprotected
-> jobs authenticate with the ping token in the URL alone.
+> **Note:** jobs authenticate with the ping token in the URL alone. The SDK
+> sends no `Authorization` header and does not read `IONHOUR_API_KEY`.
 
 ## Docs
 

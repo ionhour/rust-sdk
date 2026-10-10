@@ -16,26 +16,22 @@ use crate::options::{PingOptions, PingResult};
 /// produced within the same nanosecond tick. See [`generate_rid`].
 static RID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A registered heartbeat job, bound to a ping token and (optionally) an API
-/// key.
+/// A registered heartbeat job, bound to a ping token.
 ///
-/// Obtain one from [`Client::register_job`] or
-/// [`Client::register_job_with_key`]. Cloning is cheap — the token and key are
+/// Obtain one from [`Client::register_job`]. Cloning is cheap — the token is
 /// reference-counted (`Arc<str>`) and the client is `Arc`-backed, so a clone is
 /// a few atomic bumps with no string copies.
 #[derive(Clone)]
 pub struct Job {
     client: Client,
     token: Arc<str>,
-    api_key: Option<Arc<str>>,
 }
 
 impl Job {
-    pub(crate) fn new(client: Client, token: String, api_key: Option<String>) -> Self {
+    pub(crate) fn new(client: Client, token: String) -> Self {
         Self {
             client,
             token: Arc::from(token),
-            api_key: api_key.map(Arc::from),
         }
     }
 
@@ -63,12 +59,7 @@ impl Job {
     pub async fn success_with(&self, opts: PingOptions) -> Result<PingResult, Error> {
         self.client
             .inner()
-            .send_ping(
-                &self.token,
-                PingKind::Success,
-                self.api_key.as_deref(),
-                &opts,
-            )
+            .send_ping(&self.token, PingKind::Success, &opts)
             .await
     }
 
@@ -99,7 +90,7 @@ impl Job {
     pub async fn fail_with(&self, opts: PingOptions) -> Result<PingResult, Error> {
         self.client
             .inner()
-            .send_ping(&self.token, PingKind::Fail, self.api_key.as_deref(), &opts)
+            .send_ping(&self.token, PingKind::Fail, &opts)
             .await
     }
 
@@ -122,7 +113,7 @@ impl Job {
     pub async fn start_with(&self, opts: PingOptions) -> Result<PingResult, Error> {
         self.client
             .inner()
-            .send_ping(&self.token, PingKind::Start, self.api_key.as_deref(), &opts)
+            .send_ping(&self.token, PingKind::Start, &opts)
             .await
     }
 
@@ -263,12 +254,10 @@ fn generate_rid() -> String {
 }
 
 impl fmt::Debug for Job {
-    /// Redacts the token and API key — both are credentials and must never
-    /// appear in logs.
+    /// Redacts the token — it is the credential and must never appear in logs.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Job")
             .field("token", &"<redacted>")
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .finish_non_exhaustive()
     }
 }
@@ -346,22 +335,16 @@ mod tests {
     }
 
     #[test]
-    fn debug_redacts_token_and_key() {
+    fn debug_redacts_token() {
         let client = Client::builder()
             .base_url("https://example.com/api")
             .build()
             .unwrap();
-        let job = client
-            .register_job_with_key("super-secret-token", "ionh_secret_key")
-            .unwrap();
+        let job = client.register_job("super-secret-token").unwrap();
         let rendered = format!("{job:?}");
         assert!(
             !rendered.contains("super-secret-token"),
             "token leaked: {rendered}"
-        );
-        assert!(
-            !rendered.contains("ionh_secret_key"),
-            "key leaked: {rendered}"
         );
         assert!(rendered.contains("<redacted>"));
     }

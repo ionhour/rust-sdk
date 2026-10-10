@@ -20,8 +20,7 @@ use thiserror::Error;
 pub enum Error {
     /// The job token was empty or contained whitespace.
     ///
-    /// Returned by [`crate::Client::register_job`] and
-    /// [`crate::Client::register_job_with_key`]. Registration performs no
+    /// Returned by [`crate::Client::register_job`]. Registration performs no
     /// network call, so this fails fast at call time.
     #[error("invalid job token: must be non-empty and contain no whitespace")]
     InvalidToken,

@@ -22,9 +22,6 @@ pub const DEFAULT_RETRIES: u32 = 3;
 /// Maximum serialized payload size accepted by the server, in bytes (10 KiB).
 pub const MAX_PAYLOAD_BYTES: usize = 10_240;
 
-/// Environment variable read for the default API key.
-const ENV_API_KEY: &str = "IONHOUR_API_KEY";
-
 /// Environment variable read for the default base URL.
 const ENV_BASE_URL: &str = "IONHOUR_BASE_URL";
 
@@ -85,7 +82,6 @@ pub struct Client {
 pub(crate) struct ClientInner {
     http: reqwest::Client,
     base: Url,
-    api_key: Option<String>,
     retries: u32,
     backoff: Vec<Duration>,
     on_error: Option<OnError>,
@@ -94,7 +90,7 @@ pub(crate) struct ClientInner {
 impl Client {
     /// Create a client with default configuration and environment fallbacks.
     ///
-    /// Reads `IONHOUR_API_KEY` and `IONHOUR_BASE_URL` when present. This
+    /// Reads `IONHOUR_BASE_URL` when present. This
     /// constructor is infallible: if the environment supplies a malformed
     /// `IONHOUR_BASE_URL`, it falls back to [`DEFAULT_BASE_URL`] rather than
     /// failing, so that constructing a monitor never takes down the host
@@ -120,39 +116,14 @@ impl Client {
         ClientBuilder::new()
     }
 
-    /// Register a job by its ping token, inheriting the client's default API
-    /// key (if any).
+    /// Register a job by its ping token.
     ///
     /// Performs **no** network call. The token is validated (non-empty, no
-    /// whitespace) and [`Error::InvalidToken`] is returned otherwise.
+    /// whitespace) and [`Error::InvalidToken`] is returned otherwise. Pings
+    /// authenticate by the token alone and send no `Authorization` header.
     pub fn register_job(&self, job_token: impl Into<String>) -> Result<Job, Error> {
         let token = validate_token(job_token.into())?;
-        Ok(Job::new(self.clone(), token, self.inner.api_key.clone()))
-    }
-
-    /// Register a job with an explicit per-job API key that **overrides** the
-    /// client's default key for this job's pings.
-    ///
-    /// Performs **no** network call. The token is validated (non-empty, no
-    /// whitespace) and [`Error::InvalidToken`] is returned otherwise. An empty
-    /// or whitespace-only API key is treated as "no key" and no `Authorization`
-    /// header is sent.
-    pub fn register_job_with_key(
-        &self,
-        job_token: impl Into<String>,
-        api_key: impl Into<String>,
-    ) -> Result<Job, Error> {
-        let token = validate_token(job_token.into())?;
-        let key = api_key.into();
-        // Trim before storing: a `.env`-sourced key like " ionh_x\n" would
-        // otherwise produce a malformed "Bearer  ionh_x\n" header.
-        let trimmed = key.trim();
-        let key = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-        Ok(Job::new(self.clone(), token, key))
+        Ok(Job::new(self.clone(), token))
     }
 
     pub(crate) fn inner(&self) -> &ClientInner {
@@ -170,10 +141,6 @@ impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("base", &self.inner.base.as_str())
-            .field(
-                "api_key",
-                &self.inner.api_key.as_ref().map(|_| "<redacted>"),
-            )
             .field("retries", &self.inner.retries)
             .field("backoff", &self.inner.backoff)
             .field("on_error", &self.inner.on_error.as_ref().map(|_| "<fn>"))
@@ -193,7 +160,6 @@ impl ClientInner {
         &self,
         token: &Arc<str>,
         kind: PingKind,
-        api_key: Option<&str>,
         opts: &PingOptions,
     ) -> Result<PingResult, Error> {
         // Serialize + size-guard the payload up front. A usage error here is
@@ -218,7 +184,7 @@ impl ClientInner {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match self.attempt_once(&url, body.as_deref(), api_key).await {
+            match self.attempt_once(&url, body.as_deref()).await {
                 Ok(status) if (200..300).contains(&status) => {
                     return Ok(PingResult {
                         ok: true,
@@ -263,13 +229,8 @@ impl ClientInner {
 
     /// Perform exactly one HTTP attempt and return the status code, or the
     /// transport error.
-    async fn attempt_once(
-        &self,
-        url: &Url,
-        body: Option<&[u8]>,
-        api_key: Option<&str>,
-    ) -> Result<u16, reqwest::Error> {
-        let mut request = match body {
+    async fn attempt_once(&self, url: &Url, body: Option<&[u8]>) -> Result<u16, reqwest::Error> {
+        let request = match body {
             Some(bytes) => self
                 .http
                 .post(url.clone())
@@ -277,12 +238,6 @@ impl ClientInner {
                 .body(bytes.to_vec()),
             None => self.http.get(url.clone()),
         };
-
-        if let Some(key) = api_key {
-            if !key.is_empty() {
-                request = request.bearer_auth(key);
-            }
-        }
 
         let response = request.send().await?;
         Ok(response.status().as_u16())
@@ -380,7 +335,6 @@ impl ClientInner {
 ///
 /// # fn demo() -> Result<(), ionhour::Error> {
 /// let client = Client::builder()
-///     .api_key("ionh_live_xxx")
 ///     .timeout(Duration::from_secs(5))
 ///     .retries(4)
 ///     .build()?;
@@ -390,7 +344,6 @@ impl ClientInner {
 /// ```
 #[derive(Default)]
 pub struct ClientBuilder {
-    api_key: Option<String>,
     base_url: Option<String>,
     timeout: Option<Duration>,
     retries: Option<u32>,
@@ -404,14 +357,6 @@ impl ClientBuilder {
     /// [`ClientBuilder::build`]).
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Set the workspace API key sent as `Authorization: Bearer <key>`. This is
-    /// the client-wide default; a per-job key from
-    /// [`Client::register_job_with_key`] overrides it.
-    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
-        self.api_key = Some(api_key.into());
-        self
     }
 
     /// Set the API base URL (default [`DEFAULT_BASE_URL`]).
@@ -495,14 +440,6 @@ impl ClientBuilder {
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let base = parse_base_url(&base_raw)?;
 
-        // Trim the client-level key (explicit or from `IONHOUR_API_KEY`) before
-        // storing so whitespace can never leak into the Bearer header.
-        let api_key = self
-            .api_key
-            .or_else(|| std::env::var(ENV_API_KEY).ok())
-            .map(|k| k.trim().to_string())
-            .filter(|k| !k.is_empty());
-
         let timeout = self.timeout.unwrap_or(DEFAULT_TIMEOUT);
         let retries = self.retries.unwrap_or(DEFAULT_RETRIES).max(1);
         let user_agent = self
@@ -519,7 +456,6 @@ impl ClientBuilder {
             inner: Arc::new(ClientInner {
                 http,
                 base,
-                api_key,
                 retries,
                 backoff,
                 on_error: self.on_error,
@@ -531,7 +467,6 @@ impl ClientBuilder {
 impl fmt::Debug for ClientBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClientBuilder")
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("base_url", &self.base_url)
             .field("timeout", &self.timeout)
             .field("retries", &self.retries)

@@ -29,15 +29,13 @@ fn start_path() -> String {
 
 /// Build a client pointed at the mock server with retry backoff zeroed so the
 /// retry tests run instantly.
-fn client_for(server: &MockServer, api_key: Option<&str>) -> Client {
-    let mut builder = Client::builder()
+fn client_for(server: &MockServer) -> Client {
+    Client::builder()
         .base_url(format!("{}/api", server.uri()))
         .retries(3)
-        .backoff(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO]);
-    if let Some(key) = api_key {
-        builder = builder.api_key(key);
-    }
-    builder.build().expect("client builds")
+        .backoff(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO])
+        .build()
+        .expect("client builds")
 }
 
 fn ok_body() -> ResponseTemplate {
@@ -72,7 +70,7 @@ async fn success_uses_get_and_correct_path() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     // Zero-ceremony form: no options value constructed.
     let result = job.success().await.unwrap();
 
@@ -93,7 +91,7 @@ async fn success_with_payload_posts_json_body() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job
         .success_with(PingOptions::new().payload(payload))
         .await
@@ -113,7 +111,7 @@ async fn ping_alias_sends_success_get() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     // `ping()` is the no-arg alias for `success()`.
     let result = job.ping().await.unwrap();
 
@@ -133,7 +131,7 @@ async fn ping_with_alias_posts_payload() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     // `ping_with(opts)` is the alias for `success_with(opts)`.
     let result = job
         .ping_with(PingOptions::new().payload(payload))
@@ -153,7 +151,7 @@ async fn fail_uses_fail_suffix() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     // Zero-ceremony fail ping.
     let result = job.fail().await.unwrap();
 
@@ -172,7 +170,7 @@ async fn fail_with_posts_payload_to_fail_suffix() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job
         .fail_with(PingOptions::new().payload(payload))
         .await
@@ -193,7 +191,7 @@ async fn rid_and_duration_are_sent_as_query_params() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job
         .success_with(PingOptions::new().rid("run-1").duration_ms(1500))
         .await
@@ -204,113 +202,32 @@ async fn rid_and_duration_are_sent_as_query_params() {
 
 // --- Authorization header ---------------------------------------------------
 
-async fn auth_header_for(server: &MockServer) -> Option<String> {
+// Protected jobs are not enforced yet (spec 027), so no ping kind carries a
+// credential beyond the token in the path. The env-var variant lives in
+// tests/no_authorization_header.rs (its own process, so `set_var` cannot race).
+#[tokio::test]
+async fn pings_never_send_authorization_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ok_body())
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let job = client_for(&server).register_job(TOKEN).unwrap();
+    job.success().await.unwrap();
+    job.fail().await.unwrap();
+    job.start().await.unwrap();
+
     let requests = server.received_requests().await.expect("recording enabled");
-    let request = requests.last().expect("one request recorded");
-    request
-        .headers
-        .get("authorization")
-        .map(|value| value.to_str().unwrap().to_string())
-}
-
-#[tokio::test]
-async fn per_job_key_overrides_client_key() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(ping_path()))
-        .respond_with(ok_body())
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let job = client_for(&server, Some("client_key"))
-        .register_job_with_key(TOKEN, "job_key")
-        .unwrap();
-    job.success().await.unwrap();
-
-    assert_eq!(
-        auth_header_for(&server).await.as_deref(),
-        Some("Bearer job_key")
-    );
-}
-
-#[tokio::test]
-async fn client_key_used_when_no_per_job_key() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(ping_path()))
-        .respond_with(ok_body())
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let job = client_for(&server, Some("client_key"))
-        .register_job(TOKEN)
-        .unwrap();
-    job.success().await.unwrap();
-
-    assert_eq!(
-        auth_header_for(&server).await.as_deref(),
-        Some("Bearer client_key")
-    );
-}
-
-#[tokio::test]
-async fn no_authorization_header_when_no_key() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(ping_path()))
-        .respond_with(ok_body())
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
-    job.success().await.unwrap();
-
-    assert_eq!(auth_header_for(&server).await, None);
-}
-
-#[tokio::test]
-async fn whitespace_padded_per_job_key_is_trimmed_in_header() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(ping_path()))
-        .respond_with(ok_body())
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let job = client_for(&server, None)
-        .register_job_with_key(TOKEN, "  ionh_padded_key\n")
-        .unwrap();
-    job.success().await.unwrap();
-
-    assert_eq!(
-        auth_header_for(&server).await.as_deref(),
-        Some("Bearer ionh_padded_key")
-    );
-}
-
-#[tokio::test]
-async fn whitespace_padded_client_key_is_trimmed_in_header() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(ping_path()))
-        .respond_with(ok_body())
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let job = client_for(&server, Some("\tionh_client_key "))
-        .register_job(TOKEN)
-        .unwrap();
-    job.success().await.unwrap();
-
-    assert_eq!(
-        auth_header_for(&server).await.as_deref(),
-        Some("Bearer ionh_client_key")
-    );
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert!(
+            request.headers.get("authorization").is_none(),
+            "unexpected Authorization header on {}",
+            request.url.path()
+        );
+    }
 }
 
 // --- retry policy -----------------------------------------------------------
@@ -328,7 +245,7 @@ async fn retries_on_500_then_succeeds() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job.success().await.unwrap();
 
     assert!(result.ok);
@@ -349,7 +266,7 @@ async fn retries_on_429_then_succeeds() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job.success().await.unwrap();
 
     assert!(result.ok);
@@ -369,7 +286,7 @@ async fn retries_exhausted_on_500_returns_ok_with_failure() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     // Transport/HTTP failures stay inside Ok(PingResult), never Err.
     let result = job.success().await.unwrap();
 
@@ -392,7 +309,7 @@ async fn does_not_retry_on_400() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job.success().await.unwrap();
 
     assert!(!result.ok);
@@ -597,7 +514,7 @@ async fn run_ok_sends_success_ping_with_duration() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     // Zero-ceremony run: no options value.
     let value: u64 = job
         .run(|| async {
@@ -626,7 +543,7 @@ async fn run_err_sends_fail_ping_with_error_and_returns_original_error() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let outcome: Result<(), String> = job
         .run(|| async { Err::<(), String>("kaboom".to_string()) })
         .await;
@@ -651,7 +568,7 @@ async fn run_with_seeds_rid_on_the_success_ping() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let value: u64 = job
         .run_with(
             || async { Ok::<u64, String>(3) },
@@ -684,7 +601,7 @@ async fn start_uses_start_suffix_with_get() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job.start().await.unwrap();
 
     assert!(result.ok);
@@ -702,7 +619,7 @@ async fn start_with_payload_posts_to_start() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job
         .start_with(PingOptions::new().payload(payload))
         .await
@@ -724,7 +641,7 @@ async fn telemetry_params_are_sent_on_the_wire() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job
         .success_with(
             PingOptions::new()
@@ -751,7 +668,7 @@ async fn oversized_host_is_truncated_on_the_wire() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let result = job
         .success_with(PingOptions::new().host("h".repeat(300)))
         .await
@@ -785,7 +702,7 @@ async fn run_sends_start_ping_and_shares_generated_rid_with_terminal() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let value: u64 = job.run(|| async { Ok::<u64, String>(9) }).await.unwrap();
     assert_eq!(value, 9);
 
@@ -831,7 +748,7 @@ async fn run_with_preserves_supplied_rid_on_start_and_terminal() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     job.run_with(
         || async { Ok::<(), String>(()) },
         PingOptions::new().rid("nightly"),
@@ -851,7 +768,7 @@ async fn run_with_start_ping_false_skips_the_start_ping() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     job.run_with(
         || async { Ok::<(), String>(()) },
         PingOptions::new().start_ping(false),
@@ -890,7 +807,7 @@ async fn start_ping_failure_does_not_affect_closure_or_terminal_ping() {
         .mount(&server)
         .await;
 
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let value: u64 = job
         .run(|| async { Ok::<u64, String>(123) })
         .await
@@ -916,7 +833,7 @@ async fn oversized_payload_returns_err_without_a_network_call() {
     // Mounting nothing: assert the server never saw a request.
 
     let big = "x".repeat(11_000);
-    let job = client_for(&server, None).register_job(TOKEN).unwrap();
+    let job = client_for(&server).register_job(TOKEN).unwrap();
     let outcome = job
         .success_with(PingOptions::new().payload(json!({ "blob": big })))
         .await;

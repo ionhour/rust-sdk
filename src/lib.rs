@@ -1,15 +1,9 @@
 //! # Ionhour Rust SDK
 //!
 //! A tiny, dependency-lean client for [Ionhour](https://ionhour.com) heartbeat
-//! monitoring. Register a **Job** (an inbound heartbeat monitor) with two
-//! parameters and send success/fail pings around your scheduled work.
-//!
-//! 1. `job_token` (required) — the job's ping token. For an unprotected job the
-//!    token *is* the credential.
-//! 2. `api_key` (optional) — an Ionhour workspace API key (`ionh_…`), only
-//!    needed for **protected** jobs. When present it is sent as
-//!    `Authorization: Bearer <key>` on every ping; sending it for an
-//!    unprotected job is harmless.
+//! monitoring. Register a **Job** (an inbound heartbeat monitor) by its ping
+//! token and send success/fail pings around your scheduled work. The token
+//! *is* the credential: pings send no `Authorization` header.
 //!
 //! ## Design guarantee
 //!
@@ -57,8 +51,7 @@
 //! # async fn run_backup() -> Result<u64, std::io::Error> { Ok(42) }
 //! ```
 //!
-//! Configure explicitly with [`Client::builder`] (a protected job takes a
-//! per-job key that overrides the client key), and attach telemetry with the
+//! Configure explicitly with [`Client::builder`], and attach telemetry with the
 //! `_with` variants — [`Job::success_with`], [`Job::fail_with`],
 //! [`Job::run_with`]:
 //!
@@ -67,9 +60,9 @@
 //! use serde_json::json;
 //!
 //! # async fn demo() -> Result<(), ionhour::Error> {
-//! // Reads IONHOUR_API_KEY / IONHOUR_BASE_URL from the environment if set.
+//! // Reads IONHOUR_BASE_URL from the environment if set.
 //! let client = Client::builder().timeout(std::time::Duration::from_secs(5)).build()?;
-//! let job = client.register_job_with_key("your-job-token", "ionh_live_xxx")?;
+//! let job = client.register_job("your-job-token")?;
 //!
 //! // `?` propagates only usage errors (e.g. an oversized payload); a transport
 //! // failure comes back as Ok(result) with result.ok == false.

@@ -173,6 +173,39 @@ pub struct PingResult {
 
     /// The captured error when `ok` is `false`; `None` on success.
     pub error: Option<Error>,
+
+    /// Slug mode only: `true` when this ping auto-created the job (HTTP 201 or
+    /// a `"created": true` body). Always `false` for token pings.
+    pub created: bool,
+}
+
+/// Options for [`crate::Client::register_job_by_slug_with`].
+///
+/// ```
+/// use ionhour::SlugJobOptions;
+/// let opts = SlugJobOptions::new().create(true);
+/// # let _ = opts;
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct SlugJobOptions {
+    /// Send `?create=1` on every ping so the first one auto-creates the job.
+    /// Needs the server's `job_auto_provisioning` flag and a key allowed
+    /// `mcp:jobs`. Defaults to `false`.
+    pub create: bool,
+}
+
+impl SlugJobOptions {
+    /// Empty options (`create` off).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable or disable auto-creation on first ping (`?create=1`).
+    pub fn create(mut self, create: bool) -> Self {
+        self.create = create;
+        self
+    }
 }
 
 /// Context handed to the [`ClientBuilder::on_error`] hook alongside the
@@ -189,6 +222,7 @@ pub struct PingResult {
 #[non_exhaustive]
 pub struct PingContext {
     token: Arc<str>,
+    slug: Option<Arc<str>>,
     fail: bool,
 }
 
@@ -196,16 +230,36 @@ impl PingContext {
     /// Build a context for a ping on `token`. `fail` is `true` for a `/fail`
     /// ping, `false` for a success ping.
     pub(crate) fn new(token: Arc<str>, fail: bool) -> Self {
-        Self { token, fail }
+        Self {
+            token,
+            slug: None,
+            fail,
+        }
     }
 
-    /// The ping token of the job whose ping failed.
+    /// Build a context for a slug-mode ping. The API key is never included.
+    pub(crate) fn for_slug(slug: Arc<str>, fail: bool) -> Self {
+        Self {
+            token: Arc::from(""),
+            slug: Some(slug),
+            fail,
+        }
+    }
+
+    /// The ping token of the job whose ping failed, or `""` for a slug job
+    /// (see [`PingContext::slug`]).
     ///
     /// This is a credential; a shared hook may use it to attribute the failure,
     /// but should avoid logging it verbatim. (The [`fmt::Debug`] impl redacts
     /// it precisely so an accidental `{:?}` never leaks it.)
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// The slug of the job whose ping failed, for slug-mode jobs. A slug is
+    /// not a credential.
+    pub fn slug(&self) -> Option<&str> {
+        self.slug.as_deref()
     }
 
     /// `true` when the ping that failed was a **fail** ping (the `/fail`
@@ -222,6 +276,7 @@ impl fmt::Debug for PingContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PingContext")
             .field("token", &"<redacted>")
+            .field("slug", &self.slug.as_deref())
             .field("fail", &self.fail)
             .finish()
     }

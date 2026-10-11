@@ -7,8 +7,9 @@ use std::time::Duration;
 use reqwest::Url;
 
 use crate::error::Error;
-use crate::job::Job;
-use crate::options::{PingContext, PingOptions, PingResult};
+use crate::job::{Job, JobTarget};
+use crate::options::{PingContext, PingOptions, PingResult, SlugJobOptions};
+use crate::slug::{normalize_api_key, validate_api_key, validate_slug, SlugReply};
 
 /// Default API base URL. Override with `IONHOUR_BASE_URL` or the builder.
 pub const DEFAULT_BASE_URL: &str = "https://signal.ionhour.com/api";
@@ -22,8 +23,19 @@ pub const DEFAULT_RETRIES: u32 = 3;
 /// Maximum serialized payload size accepted by the server, in bytes (10 KiB).
 pub const MAX_PAYLOAD_BYTES: usize = 10_240;
 
+/// Default API host for slug-mode pings (`/signals/s/{slug}`). The signal host
+/// serves only token pings. Override with `IONHOUR_API_BASE_URL` or
+/// [`ClientBuilder::api_base_url`].
+pub const DEFAULT_API_BASE_URL: &str = "https://api.ionhour.com/api";
+
 /// Environment variable read for the default base URL.
 const ENV_BASE_URL: &str = "IONHOUR_BASE_URL";
+
+/// Environment variable read for the slug-mode API base URL.
+const ENV_API_BASE_URL: &str = "IONHOUR_API_BASE_URL";
+
+/// Environment variable read for the slug-mode API key.
+const ENV_API_KEY: &str = "IONHOUR_API_KEY";
 
 /// Default `User-Agent`, e.g. `ionhour-rust/0.1.0`.
 const DEFAULT_USER_AGENT: &str = concat!("ionhour-rust/", env!("CARGO_PKG_VERSION"));
@@ -82,6 +94,13 @@ pub struct Client {
 pub(crate) struct ClientInner {
     http: reqwest::Client,
     base: Url,
+    /// Slug-mode API host. An env value is parsed lazily: a malformed
+    /// `IONHOUR_API_BASE_URL` is kept as its error message and reported only by
+    /// slug registration, so token-only clients are never affected.
+    api_base: Result<Url, String>,
+    /// Slug-mode key, trimmed; `None` when absent/blank. Never printed and
+    /// never sent on token pings.
+    api_key: Option<Arc<str>>,
     retries: u32,
     backoff: Vec<Duration>,
     on_error: Option<OnError>,
@@ -126,6 +145,41 @@ impl Client {
         Ok(Job::new(self.clone(), token))
     }
 
+    /// Register a job by its slug (`^[a-z0-9_-]{1,64}$`) in the workspace of
+    /// the client's API key — slug mode.
+    ///
+    /// Pings go to `{api_base_url}/signals/s/{slug}` (plus `/fail`, `/start`)
+    /// with `Authorization: Bearer <api_key>`. Performs **no** network call.
+    /// Returns [`Error::InvalidSlug`], [`Error::MissingApiKey`] or
+    /// [`Error::InvalidApiKey`] on misuse. Use
+    /// [`Client::register_job_by_slug_with`] to enable auto-creation.
+    ///
+    /// ```no_run
+    /// # async fn demo() -> Result<(), ionhour::Error> {
+    /// // Reads IONHOUR_API_KEY (and optionally IONHOUR_API_BASE_URL).
+    /// let job = ionhour::Client::new().register_job_by_slug("nightly-report")?;
+    /// job.success().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn register_job_by_slug(&self, slug: impl Into<String>) -> Result<Job, Error> {
+        self.register_job_by_slug_with(slug, SlugJobOptions::default())
+    }
+
+    /// [`Client::register_job_by_slug`] with [`SlugJobOptions`]: `create(true)`
+    /// sends `?create=1` so the first ping auto-creates the job (server flag
+    /// `job_auto_provisioning`; [`PingResult::created`] reports it).
+    pub fn register_job_by_slug_with(
+        &self,
+        slug: impl Into<String>,
+        opts: SlugJobOptions,
+    ) -> Result<Job, Error> {
+        let slug = validate_slug(slug.into())?;
+        self.inner.api_base_url()?;
+        validate_api_key(self.inner.api_key.as_deref())?;
+        Ok(Job::new_slug(self.clone(), slug, opts.create))
+    }
+
     pub(crate) fn inner(&self) -> &ClientInner {
         &self.inner
     }
@@ -141,6 +195,7 @@ impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("base", &self.inner.base.as_str())
+            .field("api_base", &self.inner.api_base.as_ref().map(Url::as_str))
             .field("retries", &self.inner.retries)
             .field("backoff", &self.inner.backoff)
             .field("on_error", &self.inner.on_error.as_ref().map(|_| "<fn>"))
@@ -149,6 +204,13 @@ impl fmt::Debug for Client {
 }
 
 impl ClientInner {
+    /// The slug-mode API host, or the deferred configuration error.
+    fn api_base_url(&self) -> Result<&Url, Error> {
+        self.api_base
+            .as_ref()
+            .map_err(|message| Error::InvalidConfig(message.clone()))
+    }
+
     /// Send a single ping, applying the retry policy. Never panics.
     ///
     /// Usage errors — an oversized or unserializable payload, or a base URL
@@ -158,7 +220,7 @@ impl ClientInner {
     /// `Ok(PingResult { ok: false, .. })` and to the `on_error` hook.
     pub(crate) async fn send_ping(
         &self,
-        token: &Arc<str>,
+        target: &JobTarget,
         kind: PingKind,
         opts: &PingOptions,
     ) -> Result<PingResult, Error> {
@@ -179,29 +241,37 @@ impl ClientInner {
             None => None,
         };
 
-        let url = self.build_url(token, kind, opts)?;
+        let url = self.build_url(target, kind, opts)?;
+        let slug_mode = matches!(target, JobTarget::Slug { .. });
+        // Validated at registration; only slug pings carry a credential.
+        let bearer = if slug_mode {
+            self.api_key.as_deref()
+        } else {
+            None
+        };
 
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match self.attempt_once(&url, body.as_deref()).await {
-                Ok(status) if (200..300).contains(&status) => {
+            match self.attempt_once(&url, body.as_deref(), bearer).await {
+                Ok((status, reply)) if (200..300).contains(&status) => {
                     return Ok(PingResult {
                         ok: true,
                         status: Some(status),
                         error: None,
+                        created: slug_mode && (status == 201 || reply.created),
                     });
                 }
-                Ok(status) => {
+                Ok((status, reply)) => {
                     if is_retryable_status(status) && attempt < self.retries {
                         self.sleep_backoff(attempt).await;
                         continue;
                     }
                     return Ok(self.fail_result(
-                        token,
+                        target,
                         kind.is_fail(),
                         Some(status),
-                        Error::Http { status },
+                        Error::http(status, reply.code()),
                     ));
                 }
                 Err(e) => {
@@ -217,7 +287,7 @@ impl ClientInner {
                     // caller log. The hook still receives the token via
                     // PingContext, so nothing is lost.
                     return Ok(self.fail_result(
-                        token,
+                        target,
                         kind.is_fail(),
                         None,
                         Error::Transport(e.without_url()),
@@ -227,9 +297,15 @@ impl ClientInner {
         }
     }
 
-    /// Perform exactly one HTTP attempt and return the status code, or the
+    /// Perform exactly one HTTP attempt and return the status code plus the
+    /// parsed slug-route body (when `bearer` marks a slug ping), or the
     /// transport error.
-    async fn attempt_once(&self, url: &Url, body: Option<&[u8]>) -> Result<u16, reqwest::Error> {
+    async fn attempt_once(
+        &self,
+        url: &Url,
+        body: Option<&[u8]>,
+        bearer: Option<&str>,
+    ) -> Result<(u16, SlugReply), reqwest::Error> {
         let request = match body {
             Some(bytes) => self
                 .http
@@ -239,15 +315,36 @@ impl ClientInner {
             None => self.http.get(url.clone()),
         };
 
+        let request = match bearer {
+            Some(key) => request.bearer_auth(key),
+            None => request,
+        };
+
         let response = request.send().await?;
-        Ok(response.status().as_u16())
+        let status = response.status().as_u16();
+        if bearer.is_none() {
+            return Ok((status, SlugReply::default()));
+        }
+        // Best-effort, capped at 4 KiB: an unreadable body is simply ignored.
+        Ok((status, SlugReply::read(response).await))
     }
 
-    /// Build the request URL: `{base}/signals/ping/{token}[/fail|/start]` plus
-    /// the optional `rid`, `duration`, `host`, `env`, and `exit_code` query
-    /// parameters.
-    fn build_url(&self, token: &str, kind: PingKind, opts: &PingOptions) -> Result<Url, Error> {
-        let mut url = self.base.clone();
+    /// Build the request URL: `{base}/signals/ping/{token}[/fail|/start]` for
+    /// token jobs or `{api_base}/signals/s/{slug}[/fail|/start]` (+`create=1`)
+    /// for slug jobs, plus the optional `rid`, `duration`, `host`, `env`, and
+    /// `exit_code` query parameters.
+    fn build_url(
+        &self,
+        target: &JobTarget,
+        kind: PingKind,
+        opts: &PingOptions,
+    ) -> Result<Url, Error> {
+        let (mut url, prefix, id, create) = match target {
+            JobTarget::Token(token) => (self.base.clone(), "ping", &**token, false),
+            JobTarget::Slug { slug, create } => {
+                (self.api_base_url()?.clone(), "s", &**slug, *create)
+            }
+        };
         {
             let mut segments = url
                 .path_segments_mut()
@@ -255,10 +352,14 @@ impl ClientInner {
             // Tolerate a trailing slash on the base URL (would otherwise create
             // an empty segment / double slash).
             segments.pop_if_empty();
-            segments.push("signals").push("ping").push(token);
+            segments.push("signals").push(prefix).push(id);
             if let Some(suffix) = kind.path_suffix() {
                 segments.push(suffix);
             }
+        }
+
+        if create {
+            url.query_pairs_mut().append_pair("create", "1");
         }
 
         if opts.rid.is_some()
@@ -303,25 +404,30 @@ impl ClientInner {
     /// notify the `on_error` hook.
     fn fail_result(
         &self,
-        token: &Arc<str>,
+        target: &JobTarget,
         fail: bool,
         status: Option<u16>,
         error: Error,
     ) -> PingResult {
-        self.report(token, fail, &error);
+        self.report(target, fail, &error);
         PingResult {
             ok: false,
             status,
             error: Some(error),
+            created: false,
         }
     }
 
     /// Invoke the `on_error` hook if one is configured, passing the failing
     /// ping's context. The [`PingContext`] is built here (a cheap `Arc` bump)
     /// only when there is a hook to receive it, so the success path pays nothing.
-    fn report(&self, token: &Arc<str>, fail: bool, error: &Error) {
+    fn report(&self, target: &JobTarget, fail: bool, error: &Error) {
         if let Some(hook) = &self.on_error {
-            hook(error, &PingContext::new(token.clone(), fail));
+            let ctx = match target {
+                JobTarget::Token(token) => PingContext::new(token.clone(), fail),
+                JobTarget::Slug { slug, .. } => PingContext::for_slug(slug.clone(), fail),
+            };
+            hook(error, &ctx);
         }
     }
 }
@@ -345,6 +451,8 @@ impl ClientInner {
 #[derive(Default)]
 pub struct ClientBuilder {
     base_url: Option<String>,
+    api_base_url: Option<String>,
+    api_key: Option<String>,
     timeout: Option<Duration>,
     retries: Option<u32>,
     user_agent: Option<String>,
@@ -362,6 +470,22 @@ impl ClientBuilder {
     /// Set the API base URL (default [`DEFAULT_BASE_URL`]).
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Set the API host used by slug-mode jobs (default
+    /// [`DEFAULT_API_BASE_URL`], env `IONHOUR_API_BASE_URL`). Token pings keep
+    /// using [`ClientBuilder::base_url`].
+    pub fn api_base_url(mut self, api_base_url: impl Into<String>) -> Self {
+        self.api_base_url = Some(api_base_url.into());
+        self
+    }
+
+    /// Set the `ionh_` API key used ONLY by slug-mode jobs, sent as
+    /// `Authorization: Bearer <key>`. Token pings never send it. Trimmed; a
+    /// blank value counts as absent and falls back to `IONHOUR_API_KEY`.
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
         self
     }
 
@@ -439,6 +563,10 @@ impl ClientBuilder {
             .or_else(|| std::env::var(ENV_BASE_URL).ok())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let base = parse_base_url(&base_raw)?;
+        let api_base = resolve_api_base(self.api_base_url)?;
+        let api_key = normalize_api_key(self.api_key)
+            .or_else(|| normalize_api_key(std::env::var(ENV_API_KEY).ok()))
+            .map(Arc::<str>::from);
 
         let timeout = self.timeout.unwrap_or(DEFAULT_TIMEOUT);
         let retries = self.retries.unwrap_or(DEFAULT_RETRIES).max(1);
@@ -456,6 +584,8 @@ impl ClientBuilder {
             inner: Arc::new(ClientInner {
                 http,
                 base,
+                api_base,
+                api_key,
                 retries,
                 backoff,
                 on_error: self.on_error,
@@ -468,6 +598,8 @@ impl fmt::Debug for ClientBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClientBuilder")
             .field("base_url", &self.base_url)
+            .field("api_base_url", &self.api_base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("timeout", &self.timeout)
             .field("retries", &self.retries)
             .field("user_agent", &self.user_agent)
@@ -492,6 +624,23 @@ fn default_backoff(retries: u32) -> Vec<Duration> {
             }
         })
         .collect()
+}
+
+/// Resolve the slug-mode API host. An explicit builder value is validated now
+/// (loud, like `base_url`); an env value is validated lazily so a malformed
+/// `IONHOUR_API_BASE_URL` never breaks a token-only client.
+fn resolve_api_base(explicit: Option<String>) -> Result<Result<Url, String>, Error> {
+    if let Some(raw) = explicit {
+        return parse_base_url(&raw).map(Ok);
+    }
+    let raw = std::env::var(ENV_API_BASE_URL)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string());
+    Ok(parse_base_url(&raw).map_err(|error| match error {
+        Error::InvalidConfig(message) => message,
+        other => other.to_string(),
+    }))
 }
 
 /// Validate and normalize the base URL.

@@ -24,14 +24,32 @@ static RID_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct Job {
     client: Client,
-    token: Arc<str>,
+    target: JobTarget,
+}
+
+/// What a job pings: a token on the signal host (no credential), or a slug on
+/// the API host (Bearer API key from the client).
+#[derive(Clone)]
+pub(crate) enum JobTarget {
+    Token(Arc<str>),
+    Slug { slug: Arc<str>, create: bool },
 }
 
 impl Job {
     pub(crate) fn new(client: Client, token: String) -> Self {
         Self {
             client,
-            token: Arc::from(token),
+            target: JobTarget::Token(Arc::from(token)),
+        }
+    }
+
+    pub(crate) fn new_slug(client: Client, slug: String, create: bool) -> Self {
+        Self {
+            client,
+            target: JobTarget::Slug {
+                slug: Arc::from(slug),
+                create,
+            },
         }
     }
 
@@ -59,7 +77,7 @@ impl Job {
     pub async fn success_with(&self, opts: PingOptions) -> Result<PingResult, Error> {
         self.client
             .inner()
-            .send_ping(&self.token, PingKind::Success, &opts)
+            .send_ping(&self.target, PingKind::Success, &opts)
             .await
     }
 
@@ -90,7 +108,7 @@ impl Job {
     pub async fn fail_with(&self, opts: PingOptions) -> Result<PingResult, Error> {
         self.client
             .inner()
-            .send_ping(&self.token, PingKind::Fail, &opts)
+            .send_ping(&self.target, PingKind::Fail, &opts)
             .await
     }
 
@@ -113,7 +131,7 @@ impl Job {
     pub async fn start_with(&self, opts: PingOptions) -> Result<PingResult, Error> {
         self.client
             .inner()
-            .send_ping(&self.token, PingKind::Start, &opts)
+            .send_ping(&self.target, PingKind::Start, &opts)
             .await
     }
 
@@ -255,10 +273,19 @@ fn generate_rid() -> String {
 
 impl fmt::Debug for Job {
     /// Redacts the token — it is the credential and must never appear in logs.
+    /// A slug is not a credential and is shown; the API key never is.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Job")
-            .field("token", &"<redacted>")
-            .finish_non_exhaustive()
+        match &self.target {
+            JobTarget::Token(_) => f
+                .debug_struct("Job")
+                .field("token", &"<redacted>")
+                .finish_non_exhaustive(),
+            JobTarget::Slug { slug, create } => f
+                .debug_struct("Job")
+                .field("slug", &&**slug)
+                .field("create", create)
+                .finish_non_exhaustive(),
+        }
     }
 }
 

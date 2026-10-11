@@ -14,9 +14,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `retries`, `user_agent`, `on_error`). `Client` is cheaply cloneable.
 - `Client::register_job(token)` — local, non-network job registration with
   token validation (`Error::InvalidToken`).
-- Pings authenticate by job token alone and never send an `Authorization`
-  header (`IONHOUR_API_KEY` is not read). Protected jobs, which require an API
-  key on pings, will ship with their own option.
+- Token pings authenticate by job token alone and never send an
+  `Authorization` header, even with `api_key` or `IONHOUR_API_KEY` set (both
+  are slug-mode only). Protected jobs, which require an API key on pings, will
+  ship with their own option.
+- Slug mode: `Client::register_job_by_slug(slug)` and
+  `register_job_by_slug_with(slug, SlugJobOptions::new().create(true))`. Pings
+  `{api_base_url}/signals/s/{slug}` (`/fail`, `/start`) on the API host with
+  `Authorization: Bearer <key>`, adding `?create=1` when `create` is set. New
+  builder methods `api_base_url` (`IONHOUR_API_BASE_URL`, default
+  `DEFAULT_API_BASE_URL` = `https://api.ionhour.com/api`) and `api_key`
+  (`IONHOUR_API_KEY`, trimmed, blank = absent). A malformed
+  `IONHOUR_API_BASE_URL` is reported lazily as `Error::InvalidConfig` from slug
+  registration, so token-only clients are unaffected. Registration returns
+  `Error::InvalidSlug { slug_prefix }` (at most an 8-character prefix, never
+  the full value), `Error::MissingApiKey` or `Error::InvalidApiKey`.
+  `PingResult::created` reports auto-creation (201), `Error::Http` (now
+  `#[non_exhaustive]`; match with `{ status, .. }`) carries the slug error
+  `code`, at most 4 KiB of a slug body is read, and `PingContext::slug()` identifies slug jobs in the
+  `on_error` hook. Slug 4xx are never retried, except 429. The key is
+  redacted in every `Debug` impl.
 - Zero-ceremony pings: `Job::success` / `Job::ping` / `Job::fail` and
   `Job::run(fn)` take **no arguments**; the telemetry-carrying forms are
   `Job::success_with` / `Job::ping_with` / `Job::fail_with` / `Job::run_with`,

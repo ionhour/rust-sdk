@@ -3,7 +3,9 @@
 //! A tiny, dependency-lean client for [Ionhour](https://ionhour.com) heartbeat
 //! monitoring. Register a **Job** (an inbound heartbeat monitor) by its ping
 //! token and send success/fail pings around your scheduled work. The token
-//! *is* the credential: pings send no `Authorization` header.
+//! *is* the credential: token pings send no `Authorization` header.
+//! [`Client::register_job_by_slug`] addresses a job by slug instead (slug
+//! mode) and sends the API key as a Bearer header to the API host.
 //!
 //! ## Design guarantee
 //!
@@ -97,11 +99,13 @@ mod client;
 mod error;
 mod job;
 mod options;
+mod slug;
 
 pub use client::Client;
 pub use client::{
-    ClientBuilder, DEFAULT_BASE_URL, DEFAULT_RETRIES, DEFAULT_TIMEOUT, MAX_PAYLOAD_BYTES,
+    ClientBuilder, DEFAULT_API_BASE_URL, DEFAULT_BASE_URL, DEFAULT_RETRIES, DEFAULT_TIMEOUT,
+    MAX_PAYLOAD_BYTES,
 };
 pub use error::Error;
 pub use job::Job;
-pub use options::{PingContext, PingOptions, PingResult};
+pub use options::{PingContext, PingOptions, PingResult, SlugJobOptions};

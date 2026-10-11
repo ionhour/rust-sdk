@@ -32,6 +32,43 @@ job.success().await?;
 # }
 ```
 
+## Slug mode
+
+Address a job by a human-readable slug in your API key's workspace instead of
+by token, and optionally create it on the first ping. The curl equivalent:
+
+```sh
+curl -H "Authorization: Bearer $IONHOUR_API_KEY" \
+  "https://api.ionhour.com/api/signals/s/nightly-report?create=1"
+```
+
+```rust
+# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+use ionhour::{Client, SlugJobOptions};
+
+// Reads IONHOUR_API_KEY (and IONHOUR_API_BASE_URL, default https://api.ionhour.com/api).
+let job = Client::new()
+    .register_job_by_slug_with("nightly-report", SlugJobOptions::new().create(true))?;
+let result = job.success().await?;
+let _ = result.created; // true on the ping that created the job
+# Ok(())
+# }
+```
+
+`register_job_by_slug(slug)` is the form without auto-creation. The returned
+`Job` has the same `success` / `fail` / `start` / `run` surface. Slug pings go
+to the **API host** with `Authorization: Bearer <key>`; token pings never send
+the key. Registration returns `Error::InvalidSlug` for a slug outside
+`^[a-z0-9_-]{1,64}$` (it keeps only a short prefix of the rejected value), `Error::MissingApiKey` when no key is configured, and
+`Error::InvalidApiKey` for a key with whitespace or control characters.
+Auto-creation needs the server flag `job_auto_provisioning`, which is OFF by
+default; with it off a create ping comes back as
+`Error::Http { status: 403, code: Some("FEATURE_DISABLED"), .. }`. A malformed
+`IONHOUR_API_BASE_URL` surfaces as `Error::InvalidConfig` from slug
+registration and never affects token pings. Slug 4xx
+responses are never retried. 429 and 5xx use the usual backoff. The
+`on_error` hook's `PingContext::slug()` names the slug job.
+
 ## The `run` wrapper
 
 `run` wraps a fallible task — it times the closure with a monotonic clock and
@@ -60,8 +97,8 @@ let rows: u64 = job.run(|| async { run_backup().await }).await?;
 
 ## Telemetry and the `_with` variants
 
-A job is registered by its `job_token`, which is the job's credential. Pings send
-no `Authorization` header.
+A job is registered by its `job_token`, which is the job's credential. Token pings
+send no `Authorization` header.
 
 The bare `success()` / `ping()` / `fail()` / `start()` / `run(fn)` calls take no
 arguments. When you need a run id, duration, telemetry, or a payload, use the
@@ -140,6 +177,8 @@ variable → default**.
 | Retries      | `retries`      | —                   | 3 attempts (backoff 1s, then 2s clamped) |
 | User-Agent   | `user_agent`   | —                   | `ionhour-rust/<version>`           |
 | Error hook   | `on_error`     | —                   | none                               |
+| API base URL | `api_base_url` | `IONHOUR_API_BASE_URL` | `https://api.ionhour.com/api` (slug mode only) |
+| API key      | `api_key`      | `IONHOUR_API_KEY`   | none (slug mode only; trimmed, blank = absent, redacted in `Debug`) |
 
 ```rust
 use std::time::Duration;
@@ -172,8 +211,9 @@ Retries apply only to network errors, HTTP 429, and 5xx responses; other 4xx
 responses are never retried. `Client` is cheaply cloneable (`Arc` inside) —
 build one and share it across your application.
 
-> **Note:** jobs authenticate with the ping token in the URL alone. The SDK
-> sends no `Authorization` header and does not read `IONHOUR_API_KEY`.
+> **Note:** token jobs authenticate with the ping token in the URL alone and
+> never send an `Authorization` header, even when `api_key` or
+> `IONHOUR_API_KEY` is set. The key is sent only by slug-mode jobs.
 
 ## Docs
 

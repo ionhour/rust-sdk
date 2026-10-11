@@ -292,7 +292,10 @@ async fn retries_exhausted_on_500_returns_ok_with_failure() {
 
     assert!(!result.ok);
     assert_eq!(result.status, Some(500));
-    assert!(matches!(result.error, Some(Error::Http { status: 500 })));
+    assert!(matches!(
+        result.error,
+        Some(Error::Http { status: 500, .. })
+    ));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
@@ -314,7 +317,10 @@ async fn does_not_retry_on_400() {
 
     assert!(!result.ok);
     assert_eq!(result.status, Some(400));
-    assert!(matches!(result.error, Some(Error::Http { status: 400 })));
+    assert!(matches!(
+        result.error,
+        Some(Error::Http { status: 400, .. })
+    ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
